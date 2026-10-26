@@ -475,13 +475,109 @@ static void print_mask(const T * data, int64_t n_tokens, int64_t n_kv, int64_t n
     }
 }
 
+// Fills the no-cache KQ mask in bulk when each sequence occupies one contiguous
+// run of tokens with consecutive positions. Returns false when the ubatch does
+// not qualify, in which case the caller must use the generic per-pair loop.
+template <typename T>
+static bool fill_mask_contiguous(
+        T * data,
+        int64_t ne,
+        int64_t n_kv,
+        int64_t n_tokens,
+        const llama_ubatch & ubatch,
+        bool causal,
+        T mask_keep,
+        T mask_drop) {
+    if (ubatch.n_pos != 1 || n_tokens <= 0) {
+        return false;
+    }
+
+    const llama_seq_id seq0 = ubatch.seq_id[0][0];
+
+    bool single_seq = true;
+    for (int64_t i = 1; i < n_tokens; ++i) {
+        if (ubatch.seq_id[i][0] != seq0) {
+            single_seq = false;
+            break;
+        }
+    }
+
+    // one sequence and no causal mask: every row is all-zero except the padding
+    // columns at the end, so a single memset is enough
+    if (single_seq && !causal) {
+        std::memset(data, 0, ne*sizeof(T));
+
+        if (n_kv > n_tokens) {
+            for (int64_t i = 0; i < n_tokens; ++i) {
+                std::fill(data + i*n_kv + n_tokens, data + i*n_kv + n_kv, mask_drop);
+            }
+        }
+
+        return true;
+    }
+
+    // validate before writing: sequences must not be interleaved and positions
+    // within a run must increase by one
+    bool seen[LLAMA_MAX_SEQ] = {};
+
+    for (int64_t i = 0; i < n_tokens; ) {
+        const llama_seq_id seq_id = ubatch.seq_id[i][0];
+
+        if (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ || seen[seq_id]) {
+            return false;
+        }
+        seen[seq_id] = true;
+
+        int64_t j = i + 1;
+        while (j < n_tokens && ubatch.seq_id[j][0] == seq_id) {
+            if (ubatch.pos[j] != ubatch.pos[j - 1] + 1) {
+                return false;
+            }
+            ++j;
+        }
+        i = j;
+    }
+
+    std::fill(data, data + ne, mask_drop);
+
+    for (int64_t i1 = 0; i1 < n_tokens; ) {
+        const llama_seq_id seq_id = ubatch.seq_id[i1][0];
+
+        int64_t j = i1 + 1;
+        while (j < n_tokens && ubatch.seq_id[j][0] == seq_id) {
+            ++j;
+        }
+
+        for (int64_t i = i1; i < j; ++i) {
+            const int64_t hi = causal ? i + 1 : j;
+            std::fill(data + i*n_kv + i1, data + i*n_kv + hi, mask_keep);
+        }
+
+        i1 = j;
+    }
+
+    return true;
+}
+
 void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
     const int64_t n_kv     = self_kq_mask->ne[0];
     const int64_t n_tokens = ubatch->n_tokens;
 
     const auto fill_mask = [&](auto * data, int64_t ne, int n_swa, llama_swa_type swa_type) {
         using T = std::remove_reference_t<decltype(*data)>;
-        std::fill(data, data + ne, llama_cast<T>(-INFINITY));
+
+        const T mask_keep = llama_cast<T>(0.0f);
+        const T mask_drop = llama_cast<T>(-INFINITY);
+
+        if (!hparams.use_alibi && swa_type == LLAMA_SWA_TYPE_NONE &&
+                fill_mask_contiguous<T>(data, ne, n_kv, n_tokens, *ubatch, cparams.causal_attn, mask_keep, mask_drop)) {
+            if (debug) {
+                print_mask(data, n_tokens, n_kv, n_swa, swa_type);
+            }
+            return;
+        }
+
+        std::fill(data, data + ne, mask_drop);
 
         for (int i1 = 0; i1 < n_tokens; ++i1) {
             const llama_seq_id s1 = ubatch->seq_id[i1][0];
